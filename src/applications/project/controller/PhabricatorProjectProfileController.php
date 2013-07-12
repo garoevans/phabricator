@@ -255,6 +255,12 @@ final class PhabricatorProjectProfileController
     }
     $view->addAction($action);
 
+    $view->addAction(
+      id(new PhabricatorActionView())
+        ->setName(pht('Task Hierarchy'))
+        ->setIcon('menu')
+        ->setHref('/maniphest/report/hierarchy/?project='.$project->getPHID()));
+
     return $view;
   }
 
@@ -275,3 +281,4 @@ final class PhabricatorProjectProfileController
 
 
 }
+

@@ -40,6 +40,12 @@ final class ManiphestReportController extends ManiphestController {
     $nav->addLabel(pht('Burnup'));
     $nav->addFilter('burn', pht('Burnup Rate'));
 
+    if ($this->view === "hierarchy") {
+      if ($request->getStr("project") !== null) {
+        $nav->addFilter('hierarchy', pht('Hierarchy'));
+      }
+    }
+
     $this->view = $nav->selectFilter($this->view, 'user');
 
     require_celerity_resource('maniphest-report-css');
@@ -51,6 +57,9 @@ final class ManiphestReportController extends ManiphestController {
       case 'user':
       case 'project':
         $core = $this->renderOpenTasks();
+        break;
+      case 'hierarchy':
+        $core = $this->renderHierarchy($request->getStr("project"));
         break;
       default:
         return new Aphront404Response();
@@ -378,6 +387,245 @@ final class ManiphestReportController extends ManiphestController {
       number_format($info['open']),
       number_format($info['close']),
       $fmt);
+  }
+
+  public function renderHierarchy($projectPHID) {
+    $request = $this->getRequest();
+    $user    = $request->getUser();
+    $tasks   = (new ManiphestTaskQuery())
+      ->setViewer($user)
+      ->withAllProjects([$projectPHID])
+      ->execute();
+    $tasks   = mpull($tasks, null, "getPhid");
+
+    $dependencies = array();
+    $parent       = null;
+    $list         = new PhabricatorObjectItemListView();
+
+    $owner_phids = mpull($tasks, "getOwnerPHID");
+
+    $handles = id(new PhabricatorObjectHandleData($owner_phids))
+      ->setViewer($user)
+      ->loadHandles();
+
+    /**
+     * @var ManiphestTask[] $tasks
+     */
+    foreach ($tasks as $task_phid => $task) {
+      $dependencies[$task_phid] = $task->loadDependsOnTaskPHIDs();
+      if (!$task->loadDependedOnByTaskPHIDs()) {
+        $parent = $task;
+        unset($tasks[$task_phid]);
+      }
+    }
+
+    $item = new PhabricatorObjectItemView();
+    $item->setObjectName('T'.$parent->getID());
+    $item->setHeader($parent->getTitle());
+    $item->setHref('/T'.$parent->getID());
+    $item->setBarColor("black");
+
+    if ($parent->getOwnerPHID()) {
+      $owner = $handles[$parent->getOwnerPHID()];
+      $item->addByline(pht('Assigned: %s', $owner->renderLink()));
+    }
+
+    $refTasks = array();
+
+    foreach ($dependencies[$parent->getPhid()] as $dependencyPhid) {
+      if (isset($tasks[$dependencyPhid])) {
+        $refTasks[$dependencyPhid] = $tasks[$dependencyPhid];
+      }
+    }
+
+    $item->appendChild(
+      $this->renderHierarchyItemLists($refTasks, $dependencies, $tasks, $handles));
+
+    $list->addItem($item);
+
+    return $list;
+  }
+
+  /**
+   * @param ManiphestTask[]           $refTasks
+   * @param array                     $dependencies
+   * @param ManiphestTask[]           $allTasks
+   * @param PhabricatorObjectHandle[] $handles
+   * @param int                       $depth
+   *
+   * @return PhabricatorObjectItemListView|null
+   */
+  public function renderHierarchyItemLists(
+    array $refTasks,
+    array $dependencies,
+    array $allTasks,
+    array $handles,
+    $depth = 1) {
+
+    $request  = $this->getRequest();
+    $user     = $request->getUser();
+    $refTasks = msort($refTasks, "getPriority");
+    $refTasks = array_reverse($refTasks, true);
+
+    $list = null;
+
+    if ($refTasks) {
+      $list = new PhabricatorObjectItemListView();
+
+      foreach ($refTasks as $task_phid => $task) {
+        $item = new PhabricatorObjectItemView();
+        $item->setObjectName('T'.$task->getID());
+        $item->setHeader($task->getTitle());
+        $item->setHref('/T'.$task->getID());
+
+        $show_more = $hide_more = null;
+
+        if ($depth % 2) {
+          $item->setEffect("highlighted");
+        }
+
+        $status = $task->getStatus();
+
+        if ($status != ManiphestTaskStatus::STATUS_OPEN) {
+          $item->setBarColor("grey");
+        } else {
+          $item->setBarColor($this->getBarColor($depth));
+        }
+
+        if ($dependencies[$task_phid]) {
+
+          $show_id = celerity_generate_unique_node_id();
+          $hide_id = celerity_generate_unique_node_id();
+          $content_id = celerity_generate_unique_node_id();
+
+          list($show_more, $hide_more) = $this->getShowHide(
+            $show_id, $hide_id, $content_id);
+
+          $engine = new PhabricatorMarkupEngine();
+          $engine->setViewer($user);
+          $engine->addObject($task, ManiphestTask::MARKUP_FIELD_DESCRIPTION);
+          $engine->process();
+          $item->setSubHead(
+            phutil_tag(
+              'div',
+              array(
+                'class' => 'phabricator-remarkup',
+                'id' => $content_id,
+                'style' => 'display: none;',
+              ),
+              $engine->getOutput(
+                $task,
+                ManiphestTask::MARKUP_FIELD_DESCRIPTION)));
+
+          $nextRefTasks = array();
+
+          foreach ($dependencies[$task_phid] as $dependencyPhid) {
+            if (isset($allTasks[$dependencyPhid])) {
+              $nextRefTasks[$dependencyPhid] = $allTasks[$dependencyPhid];
+            }
+          }
+          $item->appendChild(
+            $this->renderHierarchyItemLists(
+              $nextRefTasks, $dependencies, $allTasks, $handles, $depth + 1));
+        }
+
+        $by_line      = "";
+        $by_line_data = array();
+
+        if ($task->getOwnerPHID()) {
+          $owner = $handles[$task->getOwnerPHID()];
+          $by_line .= 'Assigned: %s ';
+          $by_line_data[] = $owner->renderLink();
+        }
+
+        $priority_map = ManiphestTaskPriority::getTaskPriorityMap();
+        $by_line .= 'Priority: %s ';
+        $by_line_data[] = new PhutilSafeHTML(
+          '<strong>' . $priority_map[$task->getPriority()] . '</strong>');
+
+        if ($show_more && $hide_more) {
+          $by_line .= '%s %s ';
+          $by_line_data[] = new PhutilSafeHTML($show_more);
+          $by_line_data[] = new PhutilSafeHTML($hide_more);
+        }
+
+        array_unshift($by_line_data, rtrim($by_line));
+        $item->addByline(call_user_func_array("pht", $by_line_data));
+        $list->addItem($item);
+      }
+    }
+
+    return $list;
+  }
+
+  private function getShowHide($showId, $hideId, $contentId) {
+    Javelin::initBehavior('phabricator-reveal-content');
+
+    $show_more = javelin_tag(
+      'a',
+      array(
+           'href' => '#',
+           'sigil' => 'reveal-content',
+           'mustcapture' => true,
+           'id' => $showId,
+           'meta' => array(
+             'hideIDs' => array($showId),
+             'showIDs' => array($hideId, $contentId),
+           ),
+      ),
+      pht('(Show Details)'));
+
+    $hide_more = javelin_tag(
+      'a',
+      array(
+           'href' => '#',
+           'sigil' => 'reveal-content',
+           'mustcapture' => true,
+           'id' => $hideId,
+           'style' => 'display: none',
+           'meta' => array(
+             'hideIDs' => array($hideId, $contentId),
+             'showIDs' => array($showId),
+           ),
+      ),
+      pht('(Hide Details)'));
+
+    return array($show_more, $hide_more);
+  }
+
+  private function getBarColor($num) {
+    switch ($num) {
+      case 1:
+        return "red";
+        break;
+      case 2:
+        return "orange";
+        break;
+      case 3:
+        return "yellow";
+        break;
+      case 4:
+        return "green";
+        break;
+      case 5:
+        return "sky";
+        break;
+      case 6:
+        return "blue";
+        break;
+      case 7:
+        return "indigo";
+        break;
+      case 8:
+        return "violet";
+        break;
+      case 9:
+        return "black";
+        break;
+      default:
+        return "grey";
+        break;
+    }
   }
 
   public function renderOpenTasks() {
@@ -766,3 +1014,4 @@ final class ManiphestReportController extends ManiphestController {
   }
 
 }
+
